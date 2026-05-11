@@ -27,8 +27,9 @@ import { join } from "node:path";
 
 const exec = promisify(execFile);
 
-const SHORTCUT_NAME_GET_EXPENSES = "支出を取得";
-const SHORTCUT_NAME_ADD_EXPENSE = "クイック支出追加";
+// 統合 Shortcut: add/get の両方を 1 つの Shortcut で扱う。
+// JSON ペイロードに `op: "add"` / `op: "get"` を含めて分岐させる。
+const SHORTCUT_NAME = "クイック家計簿";
 
 const server = new Server(
     {
@@ -63,9 +64,38 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                             "lastMonth",
                             "thisYear",
                             "last30Days",
+                            "allTime",
                         ],
                         default: "thisMonth",
-                        description: "Period to fetch expenses for",
+                        description: [
+                            "Time window for the expense query:",
+                            "  today      — calendar today (local)",
+                            "  yesterday  — calendar yesterday",
+                            "  thisWeek   — current week, Monday-start",
+                            "  thisMonth  — calendar month-to-date",
+                            "  lastMonth  — previous calendar month",
+                            "  thisYear   — current year, Jan 1 to now",
+                            "  last30Days — rolling 30 days",
+                            "  allTime    — every recorded expense (use for cross-period analysis)",
+                        ].join("\n"),
+                    },
+                    sheet: {
+                        type: "string",
+                        description: "Filter by sheet name (e.g. '家計簿', 'テスト'). Optional.",
+                    },
+                    kind: {
+                        type: "string",
+                        enum: ["expense", "income"],
+                        description: "Filter by transaction kind. Optional (default = both).",
+                    },
+                    from: {
+                        type: "string",
+                        description:
+                            "Custom range start (ISO8601). Overrides `period` if used with `to`. Example: '2026-04-01T00:00:00+09:00'.",
+                    },
+                    to: {
+                        type: "string",
+                        description: "Custom range end (ISO8601). Use with `from` for explicit ranges.",
                     },
                 },
             },
@@ -73,14 +103,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         {
             name: "add_expense",
             description: [
-                "Record an expense in Budgety (the user's family expense tracking app).",
-                "Use this whenever the user mentions a purchase, payment, or expense in conversation",
-                "(e.g. 'コーヒー 350 円', 'lunch was 1200 yen', 'add yesterday's groceries').",
+                "Record an expense OR income entry in Budgety (the user's family expense tracking app).",
+                "Use this whenever the user mentions a purchase, payment, expense, or income in conversation",
+                "(e.g. 'コーヒー 350 円', 'lunch was 1200 yen', '今日の給料 25万', 'add yesterday's groceries').",
                 "",
                 "Behavior:",
-                "- Saves to the user's primary sheet (家計簿).",
+                "- Defaults to the user's oldest sheet (typically 家計簿) unless `sheet` is specified.",
                 "- Currency = sheet's default (JPY for Japan).",
                 "- Category is auto-classified by AI from the title — DO NOT pass a category.",
+                "- `kind` defaults to 'expense'. Pass 'income' for salary, refunds, gifts received, etc.",
+                "",
+                "Sheet selection:",
+                "- Pass `sheet` to target a non-default sheet (e.g. '仕事', '旅行').",
+                "- If `sheet` doesn't match any existing sheet, falls back to oldest sheet silently.",
+                "  → Recommend calling get_expenses first to discover valid sheet names.",
+                "- If multiple sheets share the same name (CloudKit merge / duplicate), the OLDEST",
+                "  one (by createdAt) is used. The response will include a `warning` field.",
                 "",
                 "Date handling (IMPORTANT):",
                 "- Resolve relative dates ('yesterday', '昨日', '先週月曜', etc.) to an absolute",
@@ -88,6 +126,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 "- Format: 'YYYY-MM-DDTHH:MM:SSZ' (UTC) or 'YYYY-MM-DDTHH:MM:SS+09:00' (JST).",
                 "- Omit `date` to record at the current moment.",
                 "- If the user mentions a date but not a time, use 12:00 local time as a sensible default.",
+                "- **Future dates are REJECTED** (the app records what already happened).",
+                "  Trying to record salary 'next month' returns {ok:false, error:'future date not allowed'}.",
+                "  If the user mentions a future date, tell them to wait until then or use a past date.",
+                "",
+                "Response format:",
+                "- Returns JSON with: ok (bool), amount, title, sheet, category, optional warning.",
+                "- Example success: {\"ok\":true,\"amount\":500,\"sheet\":\"テスト\",\"category\":\"食費\",\"title\":\"ランチ\"}",
+                "- If a warning is present, surface it to the user (e.g. duplicate sheet names).",
             ].join("\n"),
             inputSchema: {
                 type: "object",
@@ -112,6 +158,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                             "Resolve relative dates ('yesterday', '昨日') to absolute before passing.",
                         ].join("\n"),
                     },
+                    sheet: {
+                        type: "string",
+                        description:
+                            "Sheet name (e.g. '家計簿', '仕事'). Optional — defaults to primary sheet. Must match an existing sheet name exactly.",
+                    },
+                    kind: {
+                        type: "string",
+                        enum: ["expense", "income"],
+                        description:
+                            "Transaction kind. 'expense' (default) for payments, 'income' for salary, refunds, gifts received, etc.",
+                    },
                 },
                 required: ["amount", "title"],
             },
@@ -124,30 +181,32 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const args = req.params.arguments ?? {};
     try {
         if (name === "get_expenses") {
-            const period = args.period ?? "thisMonth";
-            const json = await runShortcutWithInput(
-                SHORTCUT_NAME_GET_EXPENSES,
-                period
-            );
+            const payload = JSON.stringify({
+                op: "get",
+                period: args.period ?? "thisMonth",
+                ...(args.sheet ? { sheet: args.sheet } : {}),
+                ...(args.kind  ? { kind:  args.kind  } : {}),
+                ...(args.from  ? { from:  args.from  } : {}),
+                ...(args.to    ? { to:    args.to    } : {}),
+            });
+            const json = await runShortcutWithInput(SHORTCUT_NAME, payload);
             return {
                 content: [{ type: "text", text: json }],
             };
         }
         if (name === "add_expense") {
-            // date は常に送る (= 未指定なら現在時刻の ISO8601)。Shortcut 側は
-            // 「日付を取得」アクションで text → Date に変換する前提。
             const dateISO = args.date && typeof args.date === "string"
                 ? args.date
                 : new Date().toISOString();
             const payload = JSON.stringify({
+                op: "add",
                 amount: args.amount,
                 title: args.title ?? "",
                 date: dateISO,
+                ...(args.sheet ? { sheet: args.sheet } : {}),
+                ...(args.kind  ? { kind:  args.kind  } : {}),
             });
-            const result = await runShortcutWithInput(
-                SHORTCUT_NAME_ADD_EXPENSE,
-                payload
-            );
+            const result = await runShortcutWithInput(SHORTCUT_NAME, payload);
             return {
                 content: [{ type: "text", text: result || "OK" }],
             };

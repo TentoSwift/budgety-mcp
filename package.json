@@ -1,10 +1,10 @@
 {
   "name": "budgety-mcp",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "description": "MCP bridge to control Budgety (家計簿アプリ) from Claude via macOS Shortcuts.",
   "type": "module",
   "main": "index.js",
-  "bin": { "budgety-mcp": "./index.js" },
+  "bin": { "budgety-mcp": "index.js" },
   "files": [
     "index.js",
     "README.md"
